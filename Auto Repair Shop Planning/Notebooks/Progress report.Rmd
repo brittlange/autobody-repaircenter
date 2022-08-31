@@ -1,0 +1,428 @@
+---
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    df_print: paged
+    toc_float: true
+toc-title: Auto Repair Shop Demand Planning
+bibliography: "`r here::here('Other Resources', 'Progress report references.bib')`"
+nocite: '@*'
+link-citations: yes
+csl: https://raw.githubusercontent.com/philipbelesky/Markdown-Citation-Style-Languages/master/mla-url.csl
+urlcolor: blue
+---
+\pagenumbering{arabic}
+\newpage
+MGT 6203: Data Analytics in Business\
+`r format(Sys.Date(), '%B %d, %Y')`\
+
+```{r include=FALSE}
+library(scales)
+```
+
+# Introduction
+## Background information
+A hypothetical auto repair shop may struggle with demand forecasting since no one plans on getting into an accident. Therefore, none of their customers have any prior intent of availing their services before finding themselves with the challenge of getting their car repaired^[We assume, of course, that all of their customers have normal psychological patterns @NormalPsychology]. By statistically analyzing and making inferences from collision data, the shop stands a chance at getting an understanding of their customers' patterns and can therefore ready themselves by making the appropriate hiring/firing and physical expansion/subletting decisions as necessary. With a little more effort, they can even learn which demographic(s) to raise awareness with such that in the event of a crisis, this repair shop is top of mind for the affected parties.
+
+This project aims at supporting the annual planning process of a hypothetical repair shop in New York state through careful data analysis and inference that leads to recommendations for the auto repair shop owner(s).
+
+## Project motivation
+Our objective with this project is to use data compiled by New York City police officers (NYPD) detailing New York motor vehicle collision reports to help a fictitious auto repair center in New York state estimate the volume of incoming vehicles they can expect to repair in the coming year, assuming their market share is known. Our analysis can help this repair center predict staffing levels that they will need to maintain and identify potential opportunities for expansion. We also aim to analyze the demographics of those involved in collisions and identify which groups make a significant contribution to car collisions. We can then propose and measure the impact of a marketing campaign for this repair center.
+
+## Assumptions
+We assume equal market share for the 3164 @DMVBodyShopCensus motor vehicle repair shops found in New York City. This gives us an average market share of `r percent(1/3164, .0001)` per shop, which we will use to estimate the volume of incoming vehicles they can expect.
+
+## Literature review
+Research conducted by Songtao He, et al. @prior-research at MIT's Computer Science and Artificial Intelligence Laboratory and the Qatar Center for Artificial Intelligence in which they used crash data from four US cities, Los Angeles, New York City, Chicago, and Boston, to develop a model predicting the number of future crashes in high risk areas, has shown on a high resolution map helped us set direction for this project. They used historical crash data, combined with GPS and satellite images and road maps. These scientists evaluated their model on crash data from 2017 and 2018, and used the next two years to test its performance at predicting crashes. Ultimately, for this project we wanted to build models for a potential real world business application so we chose a project with a fictitious business. We chose to follow a similar methodology for splitting our data and evaluating and testing our model.
+
+# Planned approach
+Our approach is detailed in this document. We intend to
+
+- Clean the data
+- Use linear regression as well as some tree-based regression approaches to describe and model the trends in the collision data.
+- Use the highest performing model to predict the volume of collisions in the city.
+- Use this prediction to extrapolate the demand that the repair shop will have.
+
+The models we intend to use are also detailed in this report.
+
+# Preparation
+## Useful libraries
+First, we import necessary libraries. These libraries will be used as follows:
+|     Library    |               Use              |
+|:--------------:|:------------------------------:|
+|     `dplyr`    |        Data manipulation       |
+|     `knitr`    |       RMarkdown knitting       |
+|  `kableExtra`  |          Kable tables          |
+|    `plotly`    |            Plotting            |
+|   `lubridate`  |        Date manipulation       |
+| `randomForest` |  Building random forest models |
+|     `rcart`    |      Building CART models      |
+|  `rpart.plot`  | Plotting regression trees built|
+```{r, message = FALSE, warning = FALSE}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(plotly)
+library(lubridate)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+```
+
+## Data Wrangling
+### Summaries
+Below, we import data from 3 sources and view the raw summaries. The data are related to each other as follows:
+[!Data relationships](../Data/Relationships.png)
+
+#### Helpers
+These functions will be reused in our endeavour to read and summarise the data at hand.
+```{r}
+read_data <- function(path) {
+  data <- read.csv(path, stringsAsFactors = FALSE)
+  colnames(data)[colnames(data) == 'CRASH.DATE'] <- 'CRASH_DATE'
+  data$CRASH_DATE <- as.Date(data$CRASH_DATE, "%m/%d/%Y")
+  data
+}
+tabulate_collisions <- function(data) {
+  kable(t(summary(data))) %>% kable_classic(full_width = TRUE, html_font = "Cambria",
+                                               font_size = 14)
+}
+```
+#### `Crashes`
+```{r, fig.width = 10, cache = FALSE}
+crashes_df <- read_data('../Data/Crashes.csv') #1,896,229 x 29
+tabulate_collisions(crashes_df)
+```
+
+#### `Person`
+```{r, fig.width = 10, cache = FALSE}
+person_df <- read_data('../Data/Person.csv') #4,692,054 x 21
+tabulate_collisions(person_df)
+```
+
+#### `Vehicles`
+```{r, fig.width = 10, cache = FALSE}
+vehicles_df <- read_data('../Data/Vehicles.csv') #3,704,406 x 25
+tabulate_collisions(vehicles_df)
+```
+
+### Cleaning and combining data sets
+As a result of a traffic safety initiative to eliminate traffic fatalities, the NYPD replaced its record management system with an electronic one, (FORMS), in 2016 @DataBackground. We see this change reflected in the chart below.
+```{r, fig.width = 10, cache = FALSE}
+monthly_agg1 <- (person_df %>% 
+                   mutate(yr_mo = paste0(substr(CRASH_DATE,1,4),'-',substr(CRASH_DATE,6,7))) %>% 
+                   group_by(yr_mo) %>% 
+                   summarise(n = n()) %>% 
+                   arrange(yr_mo)
+                 )
+plot_ly(x=monthly_agg1$yr_mo, y=monthly_agg1$n, type='bar') %>%
+  layout(title = "Crash Data by Month from 2012-2022", xaxis = list(title = 'Month'), yaxis = list(title = 'Number of Crashes'))
+```
+Note that the amount of data collected from March 2016 on greatly surpasses the amount previously collected. To control for the change in data recording systems, we will use data collected after January 1st, 2017 for full year modeling.
+
+We are now ready to filter the data to select columns of interest. We will also combine data from our three sources into one place, using their common factors. A summary can be found below.
+```{r, fig.width = 10, cache = FALSE}
+combined_df <- (crashes_df %>% 
+                  select(-c(CRASH_DATE, CRASH.TIME, CONTRIBUTING.FACTOR.VEHICLE.1, CONTRIBUTING.FACTOR.VEHICLE.2,
+                            CONTRIBUTING.FACTOR.VEHICLE.3, CONTRIBUTING.FACTOR.VEHICLE.4, CONTRIBUTING.FACTOR.VEHICLE.5,
+                            VEHICLE.TYPE.CODE.4, VEHICLE.TYPE.CODE.5,
+                            NUMBER.OF.PEDESTRIANS.INJURED, NUMBER.OF.PEDESTRIANS.KILLED,
+                            NUMBER.OF.CYCLIST.INJURED, NUMBER.OF.CYCLIST.KILLED,
+                            ON.STREET.NAME, CROSS.STREET.NAME, OFF.STREET.NAME)) %>% 
+                  inner_join(vehicles_df %>% 
+                               filter(!is.na(VEHICLE_ID)) %>% 
+                               select(-c(CRASH_DATE, CRASH_TIME, VEHICLE_ID))
+                             , by = 'COLLISION_ID') %>% 
+                  inner_join(person_df %>% 
+                               select(-c(UNIQUE_ID, CONTRIBUTING_FACTOR_1, CONTRIBUTING_FACTOR_2))
+                             , by= c('COLLISION_ID'='COLLISION_ID', 'UNIQUE_ID'='VEHICLE_ID')) %>% 
+                  filter((PED_ROLE %in% c('Driver'))) %>%  #drivers only
+                  filter((CRASH_DATE >= '2017-01-01') & (CRASH_DATE < '2021-12-01')) %>% #only from 2017-01-01 to 2021-11-30
+                  filter(PERSON_AGE > 14 & PERSON_AGE< 101) %>% 
+                  filter(PERSON_SEX == 'F' | PERSON_SEX=='M') %>% 
+                  mutate(MONTH = substr(CRASH_DATE,6,7)) %>% 
+                  mutate(TIMESTEP = as.period(interval(as.Date('2017-01-01'), CRASH_DATE)) %/% months(1)) %>% 
+                  mutate(yr_mo = paste0(substr(CRASH_DATE,1,4),'-',substr(CRASH_DATE,6,7))) %>%
+                  select(COLLISION_ID, CRASH_DATE, PERSON_AGE, PERSON_SEX, MONTH, TIMESTEP, yr_mo) %>% 
+                  arrange(CRASH_DATE)
+                )
+kable(t(summary(combined_df))) %>% kable_classic(full_width = TRUE, html_font = "Cambria", font_size = 14)
+```
+
+# Data Exploration
+## Effect of COVID-19
+We create our aggregate of volume data available for modeling and visualize it with a plot. It is interesting to note the impact of COVID-19 on crash volume beginning in March 2020.
+```{r, fig.width = 10, cache = FALSE}
+monthly_agg2 <- (combined_df %>% 
+                   group_by(TIMESTEP, yr_mo, MONTH) %>% 
+                   summarise(n = n(), .groups = 'drop') %>% 
+                   arrange(TIMESTEP, yr_mo, MONTH)
+                 )
+plot_ly(x=monthly_agg2$yr_mo, y=monthly_agg2$n, type='bar') %>%
+  layout(title = "Crash Data by Month from 2017-2021", xaxis = list(title = 'Month'), yaxis = list(title = 'Number of Crashes'))
+```
+
+# Modeling
+## Splitting into training and testing data sets
+We also created a coarse aggregate for modeling with feature groups and separate our data into training and test data sets. Since we are dealing with a temporal model, we will select all except the final year for training, and then use the final year for testing. A random split would be nonsensical for our purposes.
+```{r, fig.width = 10, cache = FALSE}
+monthly_agg3 <- (combined_df %>% 
+                   group_by(TIMESTEP, yr_mo, MONTH, PERSON_SEX, PERSON_AGE) %>% 
+                   summarise(n = n(), .groups = 'drop') %>% 
+                   arrange(TIMESTEP, yr_mo, MONTH, PERSON_SEX, PERSON_AGE)
+)
+
+train_df <- monthly_agg3 %>% filter(TIMESTEP <= 47) # <= 2020-12
+test_df <- monthly_agg3 %>% filter(TIMESTEP > 47) # > 2020-12
+```
+## Linear Regression
+### Training
+```{r, fig.width = 10, cache = FALSE}
+lm_model <- lm(n~TIMESTEP+MONTH+PERSON_AGE+PERSON_SEX, data = train_df)
+lm_summary <- summary(lm_model)
+lm_summary
+R_sq_lm_train <- lm_summary$r.squared
+R_sq_lm_train
+```
+```{r}
+SST_lm_train <- sum((train_df$n - mean(train_df$n))^2)
+SSE_lm_train <- sum((train_df$n - predict(lm_model, newdata = train_df))^2)
+R_sq_lm_train <- 1-(SSE_lm_train/SST_lm_train)
+R_sq_lm_train
+```
+
+
+### Visualisation
+```{r, fig.width = 10, cache = FALSE}
+predictions <- predict(lm_model, newdata = train_df)
+plot_ly(x=train_df$yr_mo, y=(predictions-train_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of Linear Model Residuals vs yr_mo for Training Data',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'LM Residuals', rangemode = "tozero"))
+```
+### Test Metrics
+```{r, fig.width = 10, cache = FALSE}
+SST_lm_test <- sum((test_df$n - mean(test_df$n))^2)
+SSE_lm_test <- sum((test_df$n - predict(lm_model, newdata = test_df))^2)
+R_sq_lm_test <- 1-(SSE_lm_test/SST_lm_test)
+R_sq_lm_test
+plot_ly(x=test_df$yr_mo, y=(predict(lm_model, newdata = test_df)-test_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of Linear Model Residuals vs yr_mo for Test Data',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'LM Residuals', rangemode = "tozero"))
+```
+Our linear model with training data had an R-squared value of 0.55, while it's performance on test data dropped the R-squared value to 0.08.
+
+## Random forest
+### Training
+```{r, fig.width = 10, cache=FALSE}
+set.seed(12345)
+rf_model <- randomForest(n ~ TIMESTEP + MONTH + PERSON_AGE + PERSON_SEX, data=train_df, importance=TRUE, ntree=110)  #
+summary(rf_model)
+var_importance_df <- data.frame(importance(rf_model)) %>% rename('PCT_IncMSE'='X.IncMSE') %>% arrange(desc(PCT_IncMSE))
+var_importance_df
+SST_rf_train <- sum((train_df$n - mean(train_df$n))^2)
+SSE_rf_train <- sum((train_df$n - predict(rf_model, newdata = train_df))^2)
+R_sq_rf_train <- 1-(SSE_rf_train/SST_rf_train)
+R_sq_rf_train
+```
+
+### Visualisation
+```{r, fig.width = 10, cache=FALSE}
+plot_ly(x=seq(1,length(rf_model$mse),1), y=rf_model$mse, mode='lines+markers', type='scatter') %>% 
+  layout(title = 'Plot of Random Forest Training Error vs Number of Trees',
+         xaxis = list(title = 'Number of Trees'),
+         yaxis = list(title = 'Error', rangemode = "tozero"))
+plot_ly(x=train_df$yr_mo, y=(predict(rf_model, newdata = train_df)-train_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of Random Forest Model Residuals vs yr_mo',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'RF Residuals', rangemode = "tozero"))
+```
+
+### Test Metrics
+```{r, fig.width = 10, cache=FALSE}
+SST_rf_test <- sum((test_df$n - mean(test_df$n))^2)
+SSE_rf_test <- sum((test_df$n - predict(rf_model, newdata = test_df))^2)
+R_sq_rf_test <- 1-(SSE_rf_test/SST_rf_test)
+R_sq_rf_test
+plot_ly(x=test_df$yr_mo, y=(predict(rf_model, newdata = test_df)-test_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of Random Forest Model Residuals vs yr_mo for Test Data',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'RF Residuals', rangemode = "tozero"))
+```
+
+Our random forest model performed much better, giving us an R-squared value of 0.80 on training data and 0.68 on test data.
+
+## Classification and Regression Tree
+Also known as CART.
+### Training
+```{r, fig.width = 10, cache=FALSE}
+set.seed(12345)
+min_leaf <- 3
+min_split <- 3*min_leaf
+cart_model <- rpart(n ~ TIMESTEP + MONTH + PERSON_AGE + PERSON_SEX, data=train_df, 
+                    control = c(minsplit = min_split, minbucket = min_leaf, cp=0.01)) #default = 0.01
+SST_CART_train <- sum((train_df$n - mean(train_df$n))^2)
+SSE_CART_train <- sum((train_df$n - predict(cart_model, newdata = train_df))^2)
+R_sq_cart_train <- 1-(SSE_CART_train/SST_CART_train)
+R_sq_cart_train
+```
+
+### Visualisation
+```{r, fig.width = 10, cache=FALSE}
+data.frame(Variable_Importance = cart_model$variable.importance, 
+           Variable_Importance_Pct_Tot = round(100*cart_model$variable.importance/sum(cart_model$variable.importance),0))
+rpart.plot(cart_model)
+plot_ly(x=train_df$yr_mo, y=(predict(cart_model, newdata = train_df)-train_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of CART Model Residuals vs yr_mo',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'CART Residuals', rangemode = "tozero"))
+```
+
+### Test Metrics
+```{r, fig.width = 10, cache=FALSE}
+SST_cart_test <- sum((test_df$n - mean(test_df$n))^2)
+SSE_cart_test <- sum((test_df$n - predict(cart_model, newdata = test_df))^2)
+R_sq_cart_test <- 1-(SSE_cart_test/SST_cart_test)
+R_sq_cart_test
+plot_ly(x=test_df$yr_mo, y=(predict(cart_model, newdata = test_df)-test_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of CART Model Residuals vs yr_mo for Test Data',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'CART Residuals', rangemode = "tozero"))
+```
+
+We see with the CART model that the R-squared value for training data is 0.90, but we see a drop on test data to 0.65.
+
+Each model's performance can be compared in the following plots.
+
+# Model comparison
+## Training Data
+```{r, fig.width = 10}
+plot_ly(x=train_df$n, y=(predict(cart_model, newdata = train_df)), type='scatter', mode='markers', name='CART', alpha=0.3) %>%
+  add_trace(x=train_df$n, y=(predict(rf_model, newdata = train_df)), type='scatter', mode='markers', name='RF', alpha=0.3) %>%
+  add_trace(x=train_df$n, y=(predict(lm_model, newdata = train_df)), type='scatter', mode='markers', name='LM', alpha=0.3) %>%
+  add_trace(x=c(0,500), y=c(0,500), type='scatter', mode='line', name='Perfect', alpha=1) %>%
+  layout(title = 'Plot of All Model Predictions vs Actual Values - Training Data',
+         xaxis = list(title = 'Actual Value', range=c(0,700)),
+         yaxis = list(title = 'Model Prediction', rangemode = "tozero"))
+```
+
+## Test Data
+```{r, fig.width = 10}
+plot_ly(x=test_df$n, y=(predict(cart_model, newdata = test_df)), type='scatter', mode='markers', name='CART', alpha=0.3) %>%
+  add_trace(x=test_df$n, y=(predict(rf_model, newdata = test_df)), type='scatter', mode='markers', name='RF', alpha=0.3) %>%
+  add_trace(x=test_df$n, y=(predict(lm_model, newdata = test_df)), type='scatter', mode='markers', name='LM', alpha=0.3) %>%
+  add_trace(x=c(0,300), y=c(0,300), type='scatter', mode='line', name='Perfect', alpha=1) %>%
+  layout(title = 'Plot of All Model Predictions vs Actual Values - Test Data',
+         xaxis = list(title = 'Actual Value', range=c(0,325)),
+         yaxis = list(title = 'Model Prediction', rangemode = "tozero"))
+```
+
+## Overall Model Performance Summary Table
+```{r, fig.width = 10, cache=FALSE}
+kable(data.frame(Model_Type = c('Linear', 'Random Forest', 'CART'),
+           R_sq_train = round(c(R_sq_lm_train, R_sq_rf_train, R_sq_cart_train), 2),
+           R_sq_test = round(c(R_sq_lm_test, R_sq_rf_test, R_sq_cart_test), 2))) %>% 
+  kable_classic(full_width = FALSE, html_font = "Cambria")%>%
+  row_spec(2, background = c("yellow"))
+```
+
+```{r include=FALSE}
+number_of_repair_shops <- 3164
+```
+
+We can see that our Random Forest model has the best performance on the test data, so we will move forward with this model selected. We will now estimate the monthly volume our audo body repair center can expect in the future, using our expected market share of `r percent(1/number_of_repair_shops, .0001)`.
+
+We therefore select the random forest model due to its superior performance.
+
+# Prediction
+We continue with the assumption here is that our repair shop will enjoy perfect competition. This would mean that it would have an equal share of the demand i.e. `r percent(1/number_of_repair_shops, .0001)`. With this assumption in tow, we estimate the shop's future monthly car volume.
+
+## Computation
+First, we formally compute the market share of the shop.
+```{r, fig.width = 10, cache=FALSE}
+number_of_repair_shops <- 3164
+Shop_Market_Share <- 0.01
+```
+Now, we use the test data that we had set aside to predict the monthly collision volume.
+```{r, fig.width = 10, cache=FALSE}
+test_agg_df <- test_df %>%
+  group_by(MONTH) %>%
+  summarise(Actual_NYC_Collisions=sum(n), Actual_Shop_Volume=round(Shop_Market_Share*sum(n), 0))
+```
+Here, we create dataset for future year (2021).
+```{r, fig.width = 10, cache=FALSE}
+temp1 <- data.frame(TIMESTEP = c(48:59))
+temp2 <- data.frame(MONTH = c('01','02','03','04','05','06','07','08','09','10','11','12'))
+temp3 <- data.frame(PERSON_AGE = c(15:100))
+temp4 <- data.frame(PERSON_SEX = c('M','F'))
+monthly_predictions_df <- temp1 %>%
+  bind_cols(temp2) %>%
+  full_join(temp3, by=character()) %>%
+  full_join(temp4, by=character())
+```
+And finally, we make predictions.
+```{r, fig.width = 10, cache=FALSE}
+monthly_predictions_df$predictions <- predict(rf_model, newdata = monthly_predictions_df)
+monthly_predictions_agg_df <- (monthly_predictions_df %>% 
+                                 group_by(MONTH) %>% 
+                                 summarise(Predicted_NYC_Collisions=round(sum(predictions), 0)) %>%
+                                 mutate(Predicted_Shop_Volume = round(Shop_Market_Share*Predicted_NYC_Collisions, 0)) %>% 
+                                 left_join(test_agg_df, by='MONTH') %>% 
+                                 mutate(YEAR = 2021) %>% 
+                                 select(YEAR, MONTH, Actual_NYC_Collisions, Actual_Shop_Volume, Predicted_NYC_Collisions, Predicted_Shop_Volume)
+                                 )   
+
+kable(monthly_predictions_agg_df) %>% 
+  kable_classic(full_width = FALSE, html_font = "Cambria")
+```
+
+## Plot of actual versus predicted demand volume
+```{r, fig.width = 10, cache=FALSE, warning=FALSE}
+plot_ly(x=monthly_predictions_agg_df$MONTH, y=monthly_predictions_agg_df$Actual_Shop_Volume, 
+        type='bar', name='Actual_Shop_Volume') %>% 
+  add_trace(x=monthly_predictions_agg_df$MONTH, y=monthly_predictions_agg_df$Predicted_Shop_Volume, 
+            type='bar', name='Predicted_Shop_Volume') %>% 
+  layout(title = 'Plot of actual and predicted shop volume (Test Set)',
+         xaxis = list(title = 'Months in 2021'),
+         yaxis = list(title = 'Car Volume'))
+```
+
+# Conclusion
+## Initial hypotheses
+We can see that our model actually does quite a good job predicting the shop volume, compared the actual volume the shop saw in 2021. We hypothesize that our model would have performed even better without the unforeseen consequences of COVID-19 and the subsequent increase of remote work availability.  
+
+Our next task is to start answering our secondary research objectives, including identifying key demographics for use in a marketing campaign and then measuring its cost and effect.
+
+Proportion of crashes by month, gender
+```{r, fig.width = 10, cache=FALSE, warning=FALSE}
+kable(train_df %>% 
+        group_by(PERSON_SEX) %>% 
+        summarise(n = sum(n)) %>% 
+    arrange(PERSON_SEX)) %>% 
+  kable_classic(full_width = FALSE, html_font = "Cambria")
+```
+
+Proportion of crashes by month, age group
+```{r, fig.width = 10, cache=FALSE, warning=FALSE}
+kable(train_df %>% 
+        mutate(age_group = 5*floor(PERSON_AGE/5)) %>%
+        group_by(age_group) %>% 
+        summarise(n = sum(n)) %>% 
+        arrange(age_group)) %>% 
+  kable_classic(full_width = FALSE, html_font = "Cambria")
+```
+
+An analysis done by researchers in the UK found that in road accident data reported in Great Britain, their adjusted crash risk peaked at age 21-29 years and gradually reduced as age increased. They also found a relationship between the age of the driver and the time of day an accident occurred, namely that teenage drivers were at a lesser risk of crash than other age groups @REGEV2018131. Moving forward, we plan to leverage our data to determine the demographics most likely to be involved in a car crash. We expect to use multiple linear regression with squared predictors standardized around mean 0 and standard deviation 1. We will then determine the cost of a potential promotion according to the Average Clickthrough Rates for search ads and display ads (1.91% and .35%, respectively) @ClickThroughRate. We will then outline the potential increase in market share and apply these outputs to a costing model for our auto repair shop to derive profits and return on assets for future investments, potentially using linear regression.
+
+## Future work
+To recap, for the next milestone, we intend to
+
+1. Refine our models by exploring more advanced models such as boosted trees,
+2. Perform additional data exploration, time-permitting, to get more insights from our data,
+3. Leverage our data to determine the demographics most likely to be involved in a car crash and the impact to the business of targeting these demographics with advertising,
+4. Refine our report by diving deeper into the existing literature and provide clearer ties between that research and our analysis, and
+5. Refine our report by addressing any feedback received from the graders of the progress report.
+
+# Works Cited
