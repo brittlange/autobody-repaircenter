@@ -1,0 +1,421 @@
+---
+title: "MGT-6203 Project Idea - Jeff Hedberg"
+date: 2022-06-16
+output: 
+  html_document:
+    theme:
+      version: 4
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1100px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("C:/GA Tech/MGT-6203/Project/vehicle_data")
+```
+<br/>  
+
+### Project Idea - Auto Collision Repair Center  
+##### An auto collision repair center in NYC needs a method for forcasting the volume of vehicles they will need to repair.  
+##### This is very important since COVID-19 has had a large effect on their car repair volume.  
+<br/>  
+
+##### Steps to solve this problem:  
+###### 1. Combine data from NYC Collisions, Vehicles and Persons datasets  
+###### 2. Reshape data and compute necessary features for developing vehicle repair volume models   
+###### 3. Create train test splits for modleing  
+###### 4. Build vehicle repair volume models (several types)  
+###### 5. Select the best performing model and generate predicitons for future year (assuming market share percentage)  
+###### 6. compare Modeled accuracy vs actual accuracy   
+###### 7. (Optional) Estimate effect of advertising campaign to increase market share and compute results  
+###### &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; (1) What are the key demographics to target?   
+###### &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; (2) How will this be delivered?    
+###### &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; (3) How much will this cost?   
+###### &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; (4) What will be the resulting increase in vehicle repair volume?  
+
+<br/>  
+<br/>  
+
+
+##### Import Libraries
+```{r, message=FALSE, warning=FALSE}
+#### Load libraries
+library(dplyr) # Used for data manipulation
+library(knitr) # Used for R-Markdown knitting
+library(kableExtra) # Used for Kable Tables
+library(plotly) # Used for plotting
+library(lubridate) #Used for Date manipulation
+library(randomForest) # Used for building Random Forest models
+library(rpart) # Used for building CART models
+library(rpart.plot) # Used for plotting tree
+```
+<br/>  
+
+##### Data Import, Raw Summaries  
+##### Crashes Dataset
+```{r, fig.width = 10, cache=FALSE}
+#### Load Data
+crashes_df <- read.csv('./Motor_Vehicle_Collisions_-_Crashes.csv', stringsAsFactors = FALSE) %>% 
+  mutate(CRASH.DATE = as.Date(CRASH.DATE, "%m/%d/%Y")) #1,896,229 x 29
+
+# crashes_df
+# min(crashes_df$CRASH.DATE) #"2012-07-01"
+# max(crashes_df$CRASH.DATE) #"2022-05-29
+
+kable(t(summary(crashes_df))) %>% kable_classic(full_width = TRUE, html_font = "Cambria", font_size = 14)
+```
+<br/>  
+
+##### Person Dataset
+```{r, fig.width = 10, cache=FALSE}
+#### Load Data
+person_df <- read.csv('./Motor_Vehicle_Collisions_-_Person.csv', stringsAsFactors = FALSE) %>%
+  mutate(CRASH_DATE = as.Date(CRASH_DATE, "%m/%d/%Y")) #4,692,054 x 21
+
+# person_df
+# min(person_df$CRASH_DATE) #"2012-07-01"
+# max(person_df$CRASH_DATE) #"2022-05-29"
+
+kable(t(summary(person_df))) %>% kable_classic(full_width = TRUE, html_font = "Cambria", font_size = 14)
+```
+<br/>  
+
+##### Vehicle Dataset
+```{r, fig.width = 10, cache=FALSE}
+#### Load Data
+vehicles_df <- read.csv('./Motor_Vehicle_Collisions_-_Vehicles.csv', stringsAsFactors = FALSE) %>%
+  mutate(CRASH_DATE = as.Date(CRASH_DATE, "%m/%d/%Y")) #3,704,406 x 25
+
+# vehicles_df
+# min(vehicles_df$CRASH_DATE) #"2012-07-01"
+# max(vehicles_df$CRASH_DATE) #"2021-12-04"
+
+kable(t(summary(vehicles_df))) %>% kable_classic(full_width = TRUE, html_font = "Cambria", font_size = 14)
+```
+<br/>  
+
+
+<br/>  
+<br/>  
+
+##### Show Issue with Person Dataset
+```{r, fig.width = 10, cache=FALSE}
+monthly_agg1 <- (person_df %>% 
+                   mutate(yr_mo = paste0(substr(CRASH_DATE,1,4),'-',substr(CRASH_DATE,6,7))) %>% 
+                   group_by(yr_mo) %>% 
+                   summarise(n = n()) %>% 
+                   arrange(yr_mo)
+                 )
+
+plot_ly(x=monthly_agg1$yr_mo, y=monthly_agg1$n, type='bar')
+```
+**Need to use adjust timeframe due to missing data.  Using data after 2017-01-01 for full year modeling**  
+<br/>  
+
+
+##### Process data to get to desired structure for Collision Volume Modeling
+```{r, fig.width = 10, cache=FALSE}
+combined_df <- (crashes_df %>% 
+                  select(-c(CRASH.DATE, CRASH.TIME, CONTRIBUTING.FACTOR.VEHICLE.1, CONTRIBUTING.FACTOR.VEHICLE.2,
+                            CONTRIBUTING.FACTOR.VEHICLE.3, CONTRIBUTING.FACTOR.VEHICLE.4, CONTRIBUTING.FACTOR.VEHICLE.5,
+                            VEHICLE.TYPE.CODE.4, VEHICLE.TYPE.CODE.5,
+                            NUMBER.OF.PEDESTRIANS.INJURED, NUMBER.OF.PEDESTRIANS.KILLED,
+                            NUMBER.OF.CYCLIST.INJURED, NUMBER.OF.CYCLIST.KILLED,
+                            ON.STREET.NAME, CROSS.STREET.NAME, OFF.STREET.NAME)) %>% 
+                  inner_join(vehicles_df %>% 
+                               filter(!is.na(VEHICLE_ID)) %>% 
+                               select(-c(CRASH_DATE, CRASH_TIME, VEHICLE_ID))
+                             , by = 'COLLISION_ID') %>% 
+                  inner_join(person_df %>% 
+                               select(-c(UNIQUE_ID, CONTRIBUTING_FACTOR_1, CONTRIBUTING_FACTOR_2))
+                             , by= c('COLLISION_ID'='COLLISION_ID', 'UNIQUE_ID'='VEHICLE_ID')) %>% 
+                  filter((PED_ROLE %in% c('Driver'))) %>%  #drivers only
+                  filter((CRASH_DATE >= '2017-01-01') & (CRASH_DATE < '2021-12-01')) %>% #only from 2017-01-01 to 2021-11-30
+                  filter(PERSON_AGE > 14 & PERSON_AGE< 101) %>% 
+                  filter(PERSON_SEX == 'F' | PERSON_SEX=='M') %>% 
+                  mutate(MONTH = substr(CRASH_DATE,6,7)) %>% 
+                  mutate(TIMESTEP = as.period(interval(as.Date('2017-01-01'), CRASH_DATE)) %/% months(1)) %>% 
+                  mutate(yr_mo = paste0(substr(CRASH_DATE,1,4),'-',substr(CRASH_DATE,6,7))) %>%
+                  select(COLLISION_ID, CRASH_DATE, PERSON_AGE, PERSON_SEX, MONTH, TIMESTEP, yr_mo) %>% 
+                  arrange(CRASH_DATE)
+                )
+
+# min(combined_df$CRASH_DATE) #"2017-01-01"
+# max(combined_df$CRASH_DATE) #"2021-11-30"
+```
+**Filtered un-necessary data and selected columns of interest**  
+<br/> 
+
+
+##### Aggregate, Plot of Volume Data Available for modeling
+```{r, fig.width = 10, cache=FALSE}
+monthly_agg2 <- (combined_df %>% 
+                   group_by(TIMESTEP, yr_mo, MONTH) %>% 
+                   summarise(n = n(), .groups = 'drop') %>% 
+                   arrange(TIMESTEP, yr_mo, MONTH)
+                 )
+plot_ly(x=monthly_agg2$yr_mo, y=monthly_agg2$n, type='bar')
+```
+**Notice the huge COVID-19 Impact vehicle repair volumes that's visible in this dataset!**  
+<br/>  
+
+
+##### Create Coarse Aggregate for modeling with feature groups
+```{r, fig.width = 10, cache=FALSE}
+monthly_agg3 <- (combined_df %>% 
+                   group_by(TIMESTEP, yr_mo, MONTH, PERSON_SEX, PERSON_AGE) %>% 
+                   summarise(n = n(), .groups = 'drop') %>% 
+                   arrange(TIMESTEP, yr_mo, MONTH, PERSON_SEX, PERSON_AGE)
+)
+```
+<br/>  
+
+
+##### Create Training and Test data sets
+```{r, fig.width = 10, cache=FALSE}
+train_df <- monthly_agg3 %>% filter(TIMESTEP <= 47) # <= 2020-12
+test_df <- monthly_agg3 %>% filter(TIMESTEP > 47) # > 2020-12
+```
+<br/>  
+
+
+##### Train Linear Model
+```{r, fig.width = 10, cache=FALSE}
+lm_model <- lm(data = train_df, formula = n ~ TIMESTEP + MONTH + PERSON_AGE + PERSON_SEX ) #0.5457
+summary(lm_model)
+SST_lm_train <- sum((train_df$n - mean(train_df$n))^2)
+SSE_lm_train <- sum((train_df$n - predict(lm_model, newdata = train_df))^2)
+R_sq_lm_train <- 1-(SSE_lm_train/SST_lm_train)
+R_sq_lm_train
+
+plot_ly(x=train_df$yr_mo, y=(predict(lm_model, newdata = train_df)-train_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of Linear Model Residuals vs yr_mo for Training Data',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'LM Residuals', rangemode = "tozero"))
+```
+<br/>  
+
+
+##### Linear Model Test Metrics
+```{r, fig.width = 10, cache=FALSE}
+SST_lm_test <- sum((test_df$n - mean(test_df$n))^2)
+SSE_lm_test <- sum((test_df$n - predict(lm_model, newdata = test_df))^2)
+R_sq_lm_test <- 1-(SSE_lm_test/SST_lm_test)
+R_sq_lm_test
+
+plot_ly(x=test_df$yr_mo, y=(predict(lm_model, newdata = test_df)-test_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of Linear Model Residuals vs yr_mo for Test Data',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'LM Residuals', rangemode = "tozero"))
+```
+<br/>  
+
+
+##### Train Random Forest Model
+```{r, fig.width = 10, cache=FALSE}
+set.seed(12345)
+rf_model <- randomForest(n ~ TIMESTEP + MONTH + PERSON_AGE + PERSON_SEX, data=train_df, importance=TRUE, ntree=110)  #
+summary(rf_model)
+var_importance_df <- data.frame(importance(rf_model)) %>% rename('PCT_IncMSE'='X.IncMSE') %>% arrange(desc(PCT_IncMSE))
+var_importance_df
+SST_rf_train <- sum((train_df$n - mean(train_df$n))^2)
+SSE_rf_train <- sum((train_df$n - predict(rf_model, newdata = train_df))^2)
+R_sq_rf_train <- 1-(SSE_rf_train/SST_rf_train)
+R_sq_rf_train
+
+plot_ly(x=seq(1,length(rf_model$mse),1), y=rf_model$mse, mode='lines+markers', type='scatter') %>% 
+  layout(title = 'Plot of Random Forest Training Error vs Number of Trees',
+         xaxis = list(title = 'Number of Trees'),
+         yaxis = list(title = 'Error', rangemode = "tozero"))
+
+plot_ly(x=train_df$yr_mo, y=(predict(rf_model, newdata = train_df)-train_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of Random Forest Model Residuals vs yr_mo',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'RF Residuals', rangemode = "tozero"))
+```
+<br/>  
+
+
+##### Random Forest Model Test Metrics
+```{r, fig.width = 10, cache=FALSE}
+SST_rf_test <- sum((test_df$n - mean(test_df$n))^2)
+SSE_rf_test <- sum((test_df$n - predict(rf_model, newdata = test_df))^2)
+R_sq_rf_test <- 1-(SSE_rf_test/SST_rf_test)
+R_sq_rf_test
+
+plot_ly(x=test_df$yr_mo, y=(predict(rf_model, newdata = test_df)-test_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of Random Forest Model Residuals vs yr_mo for Test Data',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'RF Residuals', rangemode = "tozero"))
+```
+<br/> 
+
+
+##### Train CART Model
+```{r, fig.width = 10, cache=FALSE}
+set.seed(12345)
+min_leaf <- 3
+min_split <- 3*min_leaf
+cart_model <- rpart(n ~ TIMESTEP + MONTH + PERSON_AGE + PERSON_SEX, data=train_df, 
+                    control = c(minsplit = min_split, minbucket = min_leaf, cp=0.01)) #default = 0.01
+SST_CART_train <- sum((train_df$n - mean(train_df$n))^2)
+SSE_CART_train <- sum((train_df$n - predict(cart_model, newdata = train_df))^2)
+R_sq_cart_train <- 1-(SSE_CART_train/SST_CART_train)
+R_sq_cart_train
+
+data.frame(Variable_Importance = cart_model$variable.importance, 
+           Variable_Importance_Pct_Tot = round(100*cart_model$variable.importance/sum(cart_model$variable.importance),0))
+
+rpart.plot(cart_model)
+
+plot_ly(x=train_df$yr_mo, y=(predict(cart_model, newdata = train_df)-train_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of CART Model Residuals vs yr_mo',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'CART Residuals', rangemode = "tozero"))
+```
+<br/>  
+
+
+##### CART Model Test Metrics
+```{r, fig.width = 10, cache=FALSE}
+SST_cart_test <- sum((test_df$n - mean(test_df$n))^2)
+SSE_cart_test <- sum((test_df$n - predict(cart_model, newdata = test_df))^2)
+R_sq_cart_test <- 1-(SSE_cart_test/SST_cart_test)
+R_sq_cart_test
+
+plot_ly(x=test_df$yr_mo, y=(predict(cart_model, newdata = test_df)-test_df$n), type='scatter', mode='markers') %>% 
+  layout(title = 'Plot of CART Model Residuals vs yr_mo for Test Data',
+         xaxis = list(title = 'yr_mo'),
+         yaxis = list(title = 'CART Residuals', rangemode = "tozero"))
+```
+<br/> 
+
+
+##### Overall Model Summary Plots - Training Data
+```{r, fig.width = 10}
+plot_ly(x=train_df$n, y=(predict(cart_model, newdata = train_df)), type='scatter', mode='markers', name='CART', alpha=0.3) %>%
+  add_trace(x=train_df$n, y=(predict(rf_model, newdata = train_df)), type='scatter', mode='markers', name='RF', alpha=0.3) %>%
+  add_trace(x=train_df$n, y=(predict(lm_model, newdata = train_df)), type='scatter', mode='markers', name='LM', alpha=0.3) %>%
+  add_trace(x=c(0,500), y=c(0,500), type='scatter', mode='line', name='Perfect', alpha=1) %>%
+  layout(title = 'Plot of All Model Predictions vs Actual Values - Training Data',
+         xaxis = list(title = 'Actual Value', range=c(0,700)),
+         yaxis = list(title = 'Model Prediction', rangemode = "tozero"))
+```
+<br/>
+
+
+##### Overall Model Summary Plots - Test Data
+```{r, fig.width = 10}
+plot_ly(x=test_df$n, y=(predict(cart_model, newdata = test_df)), type='scatter', mode='markers', name='CART', alpha=0.3) %>%
+  add_trace(x=test_df$n, y=(predict(rf_model, newdata = test_df)), type='scatter', mode='markers', name='RF', alpha=0.3) %>%
+  add_trace(x=test_df$n, y=(predict(lm_model, newdata = test_df)), type='scatter', mode='markers', name='LM', alpha=0.3) %>%
+  add_trace(x=c(0,300), y=c(0,300), type='scatter', mode='line', name='Perfect', alpha=1) %>%
+  layout(title = 'Plot of All Model Predictions vs Actual Values - Test Data',
+         xaxis = list(title = 'Actual Value', range=c(0,325)),
+         yaxis = list(title = 'Model Prediction', rangemode = "tozero"))
+```
+<br/>
+
+
+
+##### Overall Model Performance Summary Table 
+```{r, fig.width = 10, cache=FALSE}
+kable(data.frame(Model_Type = c('Linear', 'Random Forest', 'CART'),
+           R_sq_train = round(c(R_sq_lm_train, R_sq_rf_train, R_sq_cart_train), 2),
+           R_sq_test = round(c(R_sq_lm_test, R_sq_rf_test, R_sq_cart_test), 2))) %>% 
+  kable_classic(full_width = FALSE, html_font = "Cambria")%>%
+  row_spec(2, background = c("yellow"))
+```
+**=> Moving forward with the Random Forest Model**  
+<br/> 
+
+
+
+
+##### Estimate Volumes Using Random Forest model
+```{r, fig.width = 10, cache=FALSE}
+#### Assume NYC Collision Shop has 1% of Total market share - Estimate their future monthly car volume
+Shop_Market_Share <- 1/100
+
+#Compute Actual from Test Data
+test_agg_df <- test_df %>% group_by(MONTH) %>% summarise(Actual_NYC_Collisions=sum(n), Actual_Shop_Volume=round(Shop_Market_Share*sum(n), 0))
+
+#Create dataset for future year (2021) ... maybe 2022 ...decide later with team (2021 allows comparison to real volume events)
+temp1 <- data.frame(TIMESTEP = c(48:59))
+temp2 <- data.frame(MONTH = c('01','02','03','04','05','06','07','08','09','10','11','12'))
+temp3 <- data.frame(PERSON_AGE = c(15:100))
+temp4 <- data.frame(PERSON_SEX = c('M','F'))
+monthly_predictions_df <- temp1 %>% bind_cols(temp2) %>%  full_join(temp3, by=character()) %>% full_join(temp4, by=character())
+
+
+#Create predictions
+monthly_predictions_df$predictions <- predict(rf_model, newdata = monthly_predictions_df)
+monthly_predictions_agg_df <- (monthly_predictions_df %>% 
+                                 group_by(MONTH) %>% 
+                                 summarise(Predicted_NYC_Collisions=round(sum(predictions), 0)) %>%
+                                 mutate(Predicted_Shop_Volume = round(Shop_Market_Share*Predicted_NYC_Collisions, 0)) %>% 
+                                 left_join(test_agg_df, by='MONTH') %>% 
+                                 mutate(YEAR = 2021) %>% 
+                                 select(YEAR, MONTH, Actual_NYC_Collisions, Actual_Shop_Volume, Predicted_NYC_Collisions, Predicted_Shop_Volume)
+                                 )   
+  
+kable(monthly_predictions_agg_df) %>% 
+  kable_classic(full_width = FALSE, html_font = "Cambria")
+```
+<br/> 
+
+
+##### Plot of Actual_Shop_Volume and Predicted_Shop_Volume
+```{r, fig.width = 10, cache=FALSE, warning=FALSE}
+plot_ly(x=monthly_predictions_agg_df$MONTH, y=monthly_predictions_agg_df$Actual_Shop_Volume, 
+        type='bar', name='Actual_Shop_Volume') %>% 
+  add_trace(x=monthly_predictions_agg_df$MONTH, y=monthly_predictions_agg_df$Predicted_Shop_Volume, 
+            type='bar', name='Predicted_Shop_Volume') %>% 
+  layout(title = 'Plot of Actual_Shop_Volume and Predicted_Shop_Volume (Test Set)',
+         xaxis = list(title = 'Months in 2021'),
+         yaxis = list(title = 'Car volume'))
+```
+<br/> 
+<br/> 
+<br/> 
+<br/> 
+
+
+#### Additional Ideas of Interest
+##### Proportion of crashes by month, gender
+```{r, fig.width = 10, cache=FALSE, warning=FALSE}
+kable(train_df %>% 
+        group_by(PERSON_SEX) %>% 
+        summarise(n = sum(n)) %>% 
+    arrange(PERSON_SEX)) %>% 
+  kable_classic(full_width = FALSE, html_font = "Cambria")
+```
+<br/> 
+
+
+##### Proportion of crashes by month, age group
+```{r, fig.width = 10, cache=FALSE, warning=FALSE}
+kable(train_df %>% 
+        mutate(age_group = 5*floor(PERSON_AGE/5)) %>%
+        group_by(age_group) %>% 
+        summarise(n = sum(n)) %>% 
+        arrange(age_group)) %>% 
+  kable_classic(full_width = FALSE, html_font = "Cambria")
+```
+<br/> 
+<br/> 
+
+
+**Use the data below to determine how much volume can be gained by an advertising campaign targeting a certain demographic**  
+**<a href="https://blog.hubspot.com/agency/google-adwords-benchmark-data#:~:text=Cost%2DPer%2DAction-,Average%20Clickthrough%20Rate%20(CTR),0.35%25%20for%20a%20display%20ad.">Link</a>**  
+**Across all industries, the average CTR for a search ad is 1.91%, and 0.35% for a display ad.**  
+**=> Determine cost of a promotion and then outline the potential increase in marketshare for that demographic**  
+
+
